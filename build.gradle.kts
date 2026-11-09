@@ -40,7 +40,10 @@ fun getBranch(): String {
 }
 
 fun getVersionName(): String {
-    return getGitDescribe()
+    // Keep the commit hash (it identifies the exact tree) but lead with the
+    // commit count so every commit yields a distinct, monotonic version name
+    // that sorts the same way as versionCode.
+    return "${getGitCommitCount()}-${getGitDescribe()}"
 }
 
 fun getKernelPatchVersion(): String {

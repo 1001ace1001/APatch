@@ -3,6 +3,7 @@
 import com.android.build.gradle.tasks.PackageAndroidArtifact
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 import java.net.URI
+import java.util.concurrent.TimeUnit
 
 plugins {
     alias(libs.plugins.agp.app)
@@ -23,6 +24,16 @@ val managerVersionName = rootProject.extra.get("managerVersionName") as String
 val branchName = rootProject.extra.get("branchName") as String
 val kernelPatchVersion = rootProject.extra.get("kernelPatchVersion") as String
 val kernelPatchHash = rootProject.extra.get("kernelPatchHash") as String
+
+// This fork installs alongside the official APatch, so it uses its own
+// applicationId. The value is also baked into kpimg / kernelpatch.ko by
+// patchKpAssets below, because the kernel locates the manager by package name.
+val managerApplicationId = "overwhelm.debug.apatch"
+
+// SHA-256 of the DER signing certificate the kernel will trust as the manager.
+// Must match the keystore used to sign the APK (see the apksign block below).
+val managerCertSha256 = providers.gradleProperty("SIGNING_CERT_SHA256")
+    .orElse("e648c3b993af05992053432d6c927c4e78ecada1d731089293ab33edb60379a1")
 
 apksign {
     storeFileProperty = "KEYSTORE_FILE"
@@ -59,7 +70,7 @@ android {
     buildToolsVersion = androidBuildToolsVersion
 
     defaultConfig {
-	applicationId = "com.example.apatch"
+	applicationId = managerApplicationId
         minSdk = androidMinSdkVersion
         targetSdk = androidTargetSdkVersion
         versionCode = managerVersionCode
@@ -258,6 +269,81 @@ tasks.register("downloadJailbreakKo") {
     }
 }
 
+// The manager APK is located by PACKAGE NAME and authenticated by the SHA-256 of
+// its signing certificate, and both are baked into kpimg / the kernelpatch .ko
+// files. The download tasks above fetch them from upstream, so a fork that
+// renames its applicationId or signs with its own key must rewrite them here;
+// otherwise the kernel never recognises this app as the manager.
+// A plain task, not an Exec task: the work below launches the script itself
+// (after resolving a usable Python), so an Exec task would additionally try to
+// run its own unset commandLine.
+tasks.register("patchKpAssets") {
+    group = "build"
+    description = "Retargets kpimg/kernelpatch.ko at this fork's package name and signing key."
+
+    val assetsDir = File("${project.projectDir}/src/main/assets")
+    val kpimgFile = File(assetsDir, "kpimg")
+    val koFiles = jailbreakKmis.map { File(assetsDir, "${it}_kernelpatch.ko") }
+
+    // Re-run only when an input changes; the script itself is idempotent, so a
+    // stale up-to-date check can never leave the assets half patched.
+    inputs.files(kpimgFile, *koFiles.toTypedArray())
+    inputs.property("packageName", managerApplicationId)
+    inputs.property("signingDigest", managerCertSha256)
+    outputs.upToDateWhen { false }
+
+    doLast {
+        val script = rootProject.file("scripts/patch_kp_assets.py")
+
+        // Resolve a usable Python 3. On Windows "python3.exe" is often the
+        // Microsoft Store stub: it exists on PATH but never runs and never
+        // closes its stdout, so probing it through a pipe deadlocks. Output is
+        // redirected to a temp file and the process is killed on timeout.
+        fun probe(args: List<String>): Boolean {
+            val tmp = File.createTempFile("pyprobe", ".txt")
+            return try {
+                val proc = ProcessBuilder(args)
+                    .redirectErrorStream(true)
+                    .redirectOutput(tmp)
+                    .start()
+                if (!proc.waitFor(15, TimeUnit.SECONDS)) {
+                    proc.destroyForcibly()
+                    false
+                } else {
+                    proc.exitValue() == 0 && tmp.readText().contains("Python 3")
+                }
+            } catch (e: Exception) {
+                false
+            } finally {
+                tmp.delete()
+            }
+        }
+
+        val python = listOf(
+            listOf("python3", "--version"),
+            listOf("python", "--version"),
+            listOf("py", "-3", "--version"),
+        ).firstOrNull { probe(it) }
+            ?: throw GradleException(
+                "Python 3 is required to retarget kpimg/kernelpatch.ko at this " +
+                    "fork's package name. Install it, or set -PpythonExe=<path>."
+            )
+        logger.lifecycle(" - Retargeting KernelPatch assets with ${python.first()}")
+
+        val cmd = mutableListOf(
+            python.first(), script.absolutePath,
+            "--package", managerApplicationId,
+            "--digest", managerCertSha256.get(),
+            "--kpimg", kpimgFile.absolutePath,
+        )
+        koFiles.forEach { cmd += listOf("--ko", it.absolutePath) }
+        val proc = ProcessBuilder(cmd).inheritIO().start()
+        if (proc.waitFor() != 0) {
+            throw GradleException("patch_kp_assets.py failed with exit code ${proc.exitValue()}")
+        }
+    }
+}
+
 tasks.register<Copy>("mergeScripts") {
     group = "build"
     description = "Merges update-binary scripts into the assets package metadata."
@@ -275,6 +361,7 @@ tasks.getByName("preBuild").dependsOn(
     "downloadKpimg",
     "downloadKptools",
     "downloadJailbreakKo",
+    "patchKpAssets",
     "mergeScripts",
 )
 
