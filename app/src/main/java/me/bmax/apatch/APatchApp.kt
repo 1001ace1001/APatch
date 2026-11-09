@@ -245,19 +245,25 @@ class APApplication : Application(), SingletonImageLoader.Factory, Thread.Uncaug
 
                         if (Version.installedApdVInt > 0 && mgv.toInt() != Version.installedApdVInt) {
                             _apStateLiveData.postValue(State.ANDROIDPATCH_NEED_UPDATE)
-                            // su path
-                            val suPath = runCatching {
-                                RootIo.withRootBlocking {
-                                    File(SU_PATH_FILE).takeIf { it.exists() }?.readText()?.trim().orEmpty()
-                                }
-                            }.onFailure {
-                                Log.w(TAG, "Failed to read $SU_PATH_FILE", it)
-                            }.getOrDefault("")
-                            if (suPath.isNotEmpty() && Natives.suPath() != suPath) {
-                                Log.d(TAG, "su path: $suPath")
-                                Natives.resetSuPath(suPath)
-                            }
                         }
+
+                        // Re-apply the persisted su path on every launch.
+                        //
+                        // The kernel only keeps the su path in RAM: it is reset to
+                        // the built-in default (/system/bin/kp) on each boot and has
+                        // to be restored afterwards. apd does that in post-fs-data,
+                        // but since KernelPatch 53c43f3 the supercall it uses
+                        // (SUPERCALL_SU_RESET_PATH) is rejected with -EPERM for
+                        // callers that are not signature-trusted managers, so the
+                        // restore silently fails and the UI shows /system/bin/kp.
+                        //
+                        // This used to run only when the apd version changed, which
+                        // meant a device could boot with the wrong path forever.
+                        // Running it unconditionally is cheap (one supercall) and
+                        // makes the manager self-healing once the kernel accepts the
+                        // request again, e.g. after the apd-side supercmd fallback
+                        // has repaired the path at boot.
+                        restoreSuPath()
                         Log.d(TAG, "ap state: " + _apStateLiveData.value)
                     } catch (e: Exception) {
                         Log.e(TAG, "Startup probe failed", e)
@@ -301,6 +307,59 @@ class APApplication : Application(), SingletonImageLoader.Factory, Thread.Uncaug
             }
 
             return "su"
+        }
+
+        /**
+         * Restore the persisted su path into the running kernel.
+         *
+         * The kernel keeps the su path in RAM only, so every boot starts from the
+         * built-in default (`/system/bin/kp`). `/data/adb/ap/su_path` is the
+         * persistent copy; this re-applies it.
+         *
+         * Must run on a background thread: it reads a root-only file and issues a
+         * supercall.
+         */
+        private fun restoreSuPath() {
+            val persisted = runCatching {
+                RootIo.withRootBlocking {
+                    File(SU_PATH_FILE).takeIf { it.exists() }?.readText()?.trim().orEmpty()
+                }
+            }.onFailure {
+                Log.w(TAG, "Failed to read $SU_PATH_FILE", it)
+            }.getOrDefault("")
+
+            if (persisted.isEmpty()) {
+                Log.d(TAG, "$SU_PATH_FILE is missing or empty, keeping the kernel default su path")
+                return
+            }
+
+            val current = runCatching { Natives.suPath() }
+                .onFailure { Log.w(TAG, "Failed to read the kernel su path", it) }
+                .getOrDefault("")
+
+            if (current == persisted) {
+                Log.d(TAG, "su path already up to date: $persisted")
+                return
+            }
+
+            Log.d(TAG, "restoring su path: kernel='$current' persisted='$persisted'")
+            val ok = runCatching { Natives.resetSuPath(persisted) }
+                .onFailure { Log.w(TAG, "Failed to reset the su path", it) }
+                .getOrDefault(false)
+
+            if (ok) {
+                Log.i(TAG, "su path restored: $persisted")
+            } else {
+                // Expected on kernels that only authenticate signature-trusted
+                // managers, and on builds whose signing key the kernel does not
+                // know. apd retries through the key-authenticated supercmd channel
+                // at boot, and the Settings page can still switch the path by hand.
+                Log.w(
+                    TAG,
+                    "Kernel rejected the su path reset (kernel='$current'); " +
+                        "the manager is probably not a trusted signer for this kernel"
+                )
+            }
         }
     }
 
